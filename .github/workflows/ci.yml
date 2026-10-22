@@ -11,10 +11,12 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
-  build:
-    name: Build, Test, Quality and Security
+  build-and-security:
+    name: Build, Test and Security
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
@@ -37,17 +39,33 @@ jobs:
       - name: Compile, test and generate coverage
         run: ./mvnw --batch-mode --no-transfer-progress clean verify
 
-      - name: Scan source and dependencies with Trivy
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+      - name: Generate Trivy Vulnerability Report
+        uses: aquasecurity/trivy-action@v0.36.0  #a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           scan-type: fs
           scan-ref: .
           scanners: vuln,misconfig,secret
-          format: table
-          ignore-unfixed: true
-          severity: CRITICAL 
-          exit-code: '1'
+          format: json
+          output: trivy-report.json
+          exit-code: '0'
 
+      - name: Upload Vulnerability Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 30
+
+      - name: Fail build on Criticial Vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: "fs"
+          format: table
+          scan-ref: .
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+          skip-setup-trivy: true
       - name: Upload JAR
         uses: actions/upload-artifact@v6
         with:
@@ -55,3 +73,37 @@ jobs:
           path: target/*.jar
           if-no-files-found: error
           retention-days: 7
+
+      - name: Normalize image name
+        env:
+          RAW_IMAGE_NAME: ghcr.io/${{ github.repository }}
+        run: |
+          echo "IMAGE_NAME=$(echo "$RAW_IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV" 
+      
+      - name: Build Docker image
+        run: |
+          docker build --pull \
+            -t "$IMAGE_NAME:sha-${GITHUB_SHA::7}" \
+            -t "$IMAGE_NAME:latest" .
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+
+      - name: Login to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io \
+            -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push Docker image
+        run: |
+          docker push "$IMAGE_NAME:sha-${GITHUB_SHA::7}"
+          docker push "$IMAGE_NAME:latest"
